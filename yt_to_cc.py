@@ -25,12 +25,14 @@ Requirements (install once, or use the Install buttons):
     ffmpeg on PATH (winget install Gyan.FFmpeg)
     sanjuuni on PATH for video (github.com/MCJack123/sanjuuni/releases)
 """
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
@@ -329,7 +331,8 @@ def convert_to_32vid(video_path: Path, out_path: Path, monitors: str,
 
 
 def convert_to_dfpwm(audio_path: Path, out_path: Path, volume_db: float = 0.0,
-                     compressor: bool = False, gate: bool = False):
+                     compressor: bool = False, gate: bool = False,
+                     start_time: float = 0.0, end_time: float = 0.0):
     """ffmpeg has a native DFPWM1a codec. CC:Tweaked expects 48kHz mono."""
     print("Converting to DFPWM (48kHz mono)...")
     af_filters = []
@@ -339,12 +342,13 @@ def convert_to_dfpwm(audio_path: Path, out_path: Path, volume_db: float = 0.0,
         af_filters.append("acompressor=threshold=0.1:ratio=4:attack=5:release=50:makeup=2")
     if volume_db != 0.0:
         af_filters.append(f"volume={volume_db}dB")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(audio_path),
-        "-ac", "1",
-        "-ar", "48000",
-    ]
+    cmd = ["ffmpeg", "-y"]
+    if start_time > 0:
+        cmd += ["-ss", f"{start_time:.2f}"]
+    cmd += ["-i", str(audio_path)]
+    if end_time > 0:
+        cmd += ["-t", f"{end_time - start_time:.2f}"]
+    cmd += ["-ac", "1", "-ar", "48000"]
     if af_filters:
         cmd += ["-af", ",".join(af_filters)]
     cmd += ["-c:a", "dfpwm", "-f", "dfpwm", str(out_path)]
@@ -356,31 +360,52 @@ CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 
 def upload_chunked(file_path: Path, log_func) -> str:
     """Split a file into 16 MB chunks, upload each to catbox, then create
-    a jukebox txt listing the catbox IDs and upload that too. Returns the
-    catbox URL of the txt file."""
+    a jukebox txt listing the catbox IDs and upload that too.  Progress is
+    saved to a JSON file next to the source so a failed run can be resumed
+    without re-uploading chunks that already succeeded."""
+    progress_path = file_path.parent / f"{file_path.stem}_upload_progress.json"
+
     data = file_path.read_bytes()
     chunks = [data[i:i + CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
-    log_func(f"Splitting into {len(chunks)} chunk(s) of up to 16 MB each...")
+    total = len(chunks)
 
-    ids = []
+    # Load any previous progress
+    ids: list[str] = []
+    if progress_path.exists():
+        try:
+            saved = json.loads(progress_path.read_text())
+            if saved.get("total") == total and saved.get("size") == len(data):
+                ids = saved.get("ids", [])
+                log_func(f"Resuming upload: {len(ids)}/{total} chunks already done.")
+        except Exception:
+            pass
+
+    log_func(f"Splitting into {total} chunk(s) of up to 16 MB each...")
+
     for i, chunk in enumerate(chunks):
+        if i < len(ids):
+            continue  # already uploaded
         chunk_path = file_path.parent / f"{file_path.stem}_part{i}{file_path.suffix}"
         chunk_path.write_bytes(chunk)
-        log_func(f"Uploading chunk {i + 1}/{len(chunks)} ({len(chunk) / 1024 / 1024:.1f} MB)...")
-        url = _upload_catbox(chunk_path)
-        # Extract the file ID from the catbox URL (e.g. https://files.catbox.moe/b8vt60.32v -> b8vt60)
+        log_func(f"Uploading chunk {i + 1}/{total} ({len(chunk) / 1024 / 1024:.1f} MB)...")
+        url = _upload_with_retries(_upload_catbox, chunk_path, log_func=log_func)
         catbox_id = url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         ids.append(catbox_id)
         chunk_path.unlink()
         log_func(f"  Chunk {i + 1} uploaded: {catbox_id}")
+        # Save progress after each successful chunk
+        progress_path.write_text(json.dumps({
+            "total": total, "size": len(data), "ids": ids
+        }))
 
     # Build the jukebox txt
     txt_content = "# jukebox\n" + "\n".join(ids) + "\n"
     txt_path = file_path.parent / "jukebox.txt"
     txt_path.write_text(txt_content)
     log_func("Uploading jukebox index file...")
-    txt_url = _upload_catbox(txt_path)
+    txt_url = _upload_with_retries(_upload_catbox, txt_path, log_func=log_func)
     txt_path.unlink()
+    progress_path.unlink(missing_ok=True)
     log_func(f"Jukebox index uploaded: {txt_url}")
     return txt_url
 
@@ -400,6 +425,22 @@ def upload_file(file_path: Path) -> str:
             last_err = e
             continue
     raise RuntimeError(f"All upload hosts failed. Last error: {last_err}")
+
+
+def _upload_with_retries(upload_func, file_path: Path, retries: int = 5,
+                         delay: float = 5.0, log_func=None) -> str:
+    """Try an upload function up to `retries` times with a delay between attempts."""
+    for attempt in range(1, retries + 1):
+        try:
+            return upload_func(file_path)
+        except Exception as e:
+            if attempt == retries:
+                raise
+            msg = f"  Upload failed ({e}), retrying in {delay:.0f}s ({attempt}/{retries})..."
+            if log_func:
+                log_func(msg)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
 
 def _upload_catbox(file_path: Path) -> str:
@@ -452,7 +493,7 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
                    compressor: bool, gate: bool, monitors: str, scale: float,
                    monitor_side: str, quality: str, dither: str,
                    max_fps: int, tape: bool, loop: bool, larger16: bool,
-                   local_file: str,
+                   local_file: str, split_audio: bool,
                    log_func, done_func):
     """Run the full download/convert/upload pipeline in a background thread."""
     try:
@@ -479,28 +520,32 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
 
         if mode in ("video", "both"):
             out_path = output_dir / "output.32v"
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp_dir = Path(tmp)
-                if local_file:
-                    log_func(f"Using local file: {local_file}")
-                    video_path = Path(local_file)
-                else:
-                    log_func(f"Downloading video for: {query}")
-                    video_path = download_video(query, tmp_dir, log_func)
-                if larger16:
-                    log_func("Larger than 16 mode: no size limit, will split into chunks.")
-                    log_func("Speed guide: median is fast, kmeans is several times slower, octree slowest.")
-                    src = limit_fps(video_path, tmp_dir, max_fps, log_func)
-                    log_func("Converting with sanjuuni...")
-                    convert_to_32vid(src, out_path, monitors, scale, quality,
-                                     dither, log_func)
-                else:
-                    log_func(f"Target: under {SIZE_TARGET / 1024 / 1024:.1f} MB "
-                             f"(CC:Tweaked max_download {CC_MAX_DOWNLOAD}).")
-                    log_func("Speed guide: median is fast, kmeans is several times slower, octree slowest.")
-                    convert_within_limit(video_path, out_path, tmp_dir, monitors,
-                                         scale, quality, dither,
-                                         max_fps, log_func)
+            # Skip encoding if a .32v already exists (resume upload only)
+            if out_path.exists():
+                log_func(f"Found existing {out_path.name} ({out_path.stat().st_size / 1024 / 1024:.1f} MB) — skipping encode, resuming upload.")
+            else:
+                with tempfile.TemporaryDirectory() as tmp:
+                    tmp_dir = Path(tmp)
+                    if local_file:
+                        log_func(f"Using local file: {local_file}")
+                        video_path = Path(local_file)
+                    else:
+                        log_func(f"Downloading video for: {query}")
+                        video_path = download_video(query, tmp_dir, log_func)
+                    if larger16:
+                        log_func("Larger than 16 mode: no size limit, will split into chunks.")
+                        log_func("Speed guide: median is fast, kmeans is several times slower, octree slowest.")
+                        src = limit_fps(video_path, tmp_dir, max_fps, log_func)
+                        log_func("Converting with sanjuuni...")
+                        convert_to_32vid(src, out_path, monitors, scale, quality,
+                                         dither, log_func)
+                    else:
+                        log_func(f"Target: under {SIZE_TARGET / 1024 / 1024:.1f} MB "
+                                 f"(CC:Tweaked max_download {CC_MAX_DOWNLOAD}).")
+                        log_func("Speed guide: median is fast, kmeans is several times slower, octree slowest.")
+                        convert_within_limit(video_path, out_path, tmp_dir, monitors,
+                                             scale, quality, dither,
+                                             max_fps, log_func)
             size_kb = out_path.stat().st_size / 1024
             log_func(f"Encoded: {out_path.name} ({size_kb:.1f} KB)")
             if larger16:
@@ -512,21 +557,39 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
             log_func(f"Video uploaded: {video_url}")
 
         if mode in ("audio", "both"):
-            out_path = output_dir / "output.dfpwm"
-            if local_file:
-                log_func(f"Using local file: {local_file}")
-                convert_to_dfpwm(Path(local_file), out_path, volume_db, compressor, gate)
-            else:
+            audio_source = Path(local_file) if local_file else None
+            if not audio_source:
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_dir = Path(tmp)
                     log_func(f"Downloading audio for: {query}")
-                    wav_path = download_audio(query, tmp_dir)
-                    convert_to_dfpwm(wav_path, out_path, volume_db, compressor, gate)
-            size_kb = out_path.stat().st_size / 1024
-            log_func(f"Encoded: {out_path.name} ({size_kb:.1f} KB)")
-            log_func("Uploading audio...")
-            audio_url = upload_file(out_path)
-            log_func(f"Audio uploaded: {audio_url}")
+                    audio_source = download_audio(query, tmp_dir)
+            # Check duration to decide if we need to split
+            duration = video_duration(audio_source)
+            if split_audio or duration > 128 * 60:
+                log_func(f"Audio is {duration / 60:.0f} min — splitting into two halves.")
+                half = duration / 2
+                out_path_1 = output_dir / "output_part1.dfpwm"
+                out_path_2 = output_dir / "output_part2.dfpwm"
+                # First half
+                convert_to_dfpwm(audio_source, out_path_1, volume_db, compressor, gate, end_time=half)
+                # Second half
+                convert_to_dfpwm(audio_source, out_path_2, volume_db, compressor, gate, start_time=half)
+                audio_urls = []
+                for p in (out_path_1, out_path_2):
+                    size_kb = p.stat().st_size / 1024
+                    log_func(f"Encoded: {p.name} ({size_kb:.1f} KB)")
+                    log_func(f"Uploading {p.name}...")
+                    audio_urls.append(upload_file(p))
+                    log_func(f"Uploaded: {audio_urls[-1]}")
+                audio_url = audio_urls
+            else:
+                out_path = output_dir / "output.dfpwm"
+                convert_to_dfpwm(audio_source, out_path, volume_db, compressor, gate)
+                size_kb = out_path.stat().st_size / 1024
+                log_func(f"Encoded: {out_path.name} ({size_kb:.1f} KB)")
+                log_func("Uploading audio...")
+                audio_url = upload_file(out_path)
+                log_func(f"Audio uploaded: {audio_url}")
 
         log_func("")
         log_func("=" * 50)
@@ -552,7 +615,11 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
             if video_url:
                 log_func("")
             log_func("Audio:")
-            log_func(f'  pastebin run D1m1dq0n "{audio_url}" song.dfpwm')
+            if isinstance(audio_url, list):
+                for j, url in enumerate(audio_url, 1):
+                    log_func(f'  pastebin run D1m1dq0n "{url}" song_part{j}.dfpwm')
+            else:
+                log_func(f'  pastebin run D1m1dq0n "{audio_url}" song.dfpwm')
         log_func("")
         log_func(f"Local files: {output_dir}")
         log_func("=" * 50)
@@ -689,6 +756,9 @@ class App(tk.Tk):
         self.gate_var = tk.BooleanVar()
         ttk.Checkbutton(opt_frame, text="Gate", variable=self.gate_var).pack(side="left", padx=(8, 0))
 
+        self.split_audio_var = tk.BooleanVar()
+        ttk.Checkbutton(opt_frame, text="Split audio", variable=self.split_audio_var).pack(side="left", padx=(8, 0))
+
         self.go_btn = ttk.Button(opt_frame, text="Convert", command=self.start)
         self.go_btn.pack(side="right")
 
@@ -817,6 +887,7 @@ class App(tk.Tk):
                   self.dither_var.get(),
                   self._fps_value(), self.tape_var.get(), self.loop_var.get(),
                   self.larger16_var.get(), local_file,
+                  self.split_audio_var.get(),
                   self.log_msg, self.on_done),
             daemon=True,
         )

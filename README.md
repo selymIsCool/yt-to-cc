@@ -6,6 +6,8 @@ Converts YouTube videos (or local files) into formats that work with CC:Tweaked 
 
 Everything runs locally — just paste a YouTube link (or browse for a file), hit Convert, and it spits out the in-game commands to run.
 
+![screenshot](screenshot.png)
+
 ## What you need
 
 - Python 3
@@ -30,3 +32,4 @@ It uploads the result to catbox and gives you the `pastebin run` commands to pas
 - The volume slider, compressor, and gate are there because DFPWM can be quiet
 - Monitor size is in blocks (e.g. 3x2), scale 0.5 gives the most pixels
 - Local files can be mp3, wav, flac, mp4, mkv, avi, whatever ffmpeg handles
+- "Split audio" splits long audio into two halves (auto-splits over 128 min)

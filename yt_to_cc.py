@@ -520,9 +520,13 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
 
         if mode in ("video", "both"):
             out_path = output_dir / "output.32v"
-            # Skip encoding if a .32v already exists (resume upload only)
-            if out_path.exists():
-                log_func(f"Found existing {out_path.name} ({out_path.stat().st_size / 1024 / 1024:.1f} MB) — skipping encode, resuming upload.")
+            # Only resume from an existing .32v if the user didn't ask for
+            # something new (both query and local_file are empty).
+            if out_path.exists() and (query or local_file):
+                log_func(f"Deleting old {out_path.name} — new input provided.")
+                out_path.unlink()
+            if out_path.exists() and not query and not local_file:
+                log_func(f"Found existing {out_path.name} ({out_path.stat().st_size / 1024 / 1024:.1f} MB) — no new input, resuming upload.")
             else:
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_dir = Path(tmp)
@@ -869,7 +873,9 @@ class App(tk.Tk):
     def start(self):
         query = self.query_var.get().strip()
         local_file = self.local_file_var.get().strip()
-        if not query and not local_file:
+        output_dir = Path.home() / "dfpwm_output"
+        has_existing = (output_dir / "output.32v").exists() or (output_dir / "output.dfpwm").exists()
+        if not query and not local_file and not has_existing:
             return
         self.go_btn.configure(state="disabled")
         self.entry.configure(state="disabled")

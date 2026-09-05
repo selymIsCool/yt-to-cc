@@ -562,11 +562,12 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
 
         if mode in ("audio", "both"):
             audio_source = Path(local_file) if local_file else None
+            audio_tmp = None
             if not audio_source:
-                with tempfile.TemporaryDirectory() as tmp:
-                    tmp_dir = Path(tmp)
-                    log_func(f"Downloading audio for: {query}")
-                    audio_source = download_audio(query, tmp_dir)
+                audio_tmp = tempfile.TemporaryDirectory()
+                tmp_dir = Path(audio_tmp.name)
+                log_func(f"Downloading audio for: {query}")
+                audio_source = download_audio(query, tmp_dir)
             # Check duration to decide if we need to split
             duration = video_duration(audio_source)
             if split_audio or duration > 128 * 60:
@@ -594,6 +595,8 @@ def run_conversion(mode: str, query: str, keep: bool, volume_db: float,
                 log_func("Uploading audio...")
                 audio_url = upload_file(out_path)
                 log_func(f"Audio uploaded: {audio_url}")
+            if audio_tmp:
+                audio_tmp.cleanup()
 
         log_func("")
         log_func("=" * 50)
